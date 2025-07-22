@@ -21,18 +21,3 @@ GlucIA es un asistente de inteligencia artificial local implementado sobre una R
 Diabetes, Hipoglucemia, Hiperglucemia, Asistente con IA, Raspberry Pi 5, TinyLlama, Whisper, Piper TTS, RAG, Salud.
 
 ---
-
-### **Poster o brochure**
-Poster
-
----
-
-### **Imagen tipo banner**
-Imagen Resultado Final
-
----
-
-### **Vídeo del proyecto**
-Video
-
----

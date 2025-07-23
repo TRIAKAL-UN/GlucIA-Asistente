@@ -1,0 +1,220 @@
+import sounddevice as sd
+import numpy as np
+import wave
+import whisper
+import subprocess
+import time
+
+#voz
+from piper import PiperVoice
+import scipy.io.wavfile
+import os
+import platform
+import scipy
+
+
+# LangChain RAG + QA
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.memory import ConversationBufferWindowMemory
+from langchain_community.llms import Ollama
+
+# ==== CONFIGURACIÓN INICIAL ====
+DURACION_SEGUNDOS = 5
+FRECUENCIA = 44100
+ARCHIVO_AUDIO = "audio_temp.wav"
+MODELO_WHISPER = "base"
+IDIOMA = 'es'
+
+# ==== CONFIGURACIÓN RAG Y QA ====
+vectores = HuggingFaceEmbeddings(model_name="/home/glucia/Asistente/all-MiniLM-L6-v2")
+almacen_vectores = FAISS.load_local(
+    "glucia_index",
+    vectores,
+    allow_dangerous_deserialization=True
+)
+memoria = ConversationBufferWindowMemory(k=0, return_messages=True)
+modelo_llm = Ollama(model="tinyllama")
+
+# ==== INICIALIZACIÓN ====
+modelo = whisper.load_model(MODELO_WHISPER)
+
+# ==== Piper =====
+VOICE_PATH = "es_AR-daniela-high.onnx"
+voice = PiperVoice.load(VOICE_PATH)
+
+
+# ==== FUNCIONES ====
+
+def grabar_audio(nombre_archivo=ARCHIVO_AUDIO, duracion=DURACION_SEGUNDOS):
+    print("Grabando.")
+    grabacion = sd.rec(int(duracion * FRECUENCIA), samplerate=FRECUENCIA, channels=1, dtype='int16')
+    sd.wait()
+    with wave.open(nombre_archivo, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(FRECUENCIA)
+        wf.writeframes(grabacion.tobytes())
+    return nombre_archivo
+
+def transcribir_audio(ruta):
+    print("Transcripción")
+    resultado = modelo.transcribe(ruta, language=IDIOMA)
+    texto = resultado["text"].strip().lower()
+    print(f"Conversión: '{texto}'")
+    return texto
+
+def sintetizar_voz(texto, archivo_salida="respuesta_glucia.wav"):
+    """
+    Sintetiza el texto a voz, guarda el audio en un archivo y luego lo reproduce.
+    """
+    print("Generando voz con Piper y guardando en archivo.")
+
+    # 1. Abre el archivo en modo escritura ('wb') para que Piper pueda guardar el audio.
+    with wave.open(archivo_salida, 'wb') as wf:
+        # Piper sintetiza el texto y escribe directamente en el objeto de archivo 'wf'.
+        voice.synthesize_wav(texto, wf)
+
+    print(f"Archivo de audio '{archivo_salida}' creado exitosamente.")
+
+    # 2. Ahora que el archivo existe, reprodúcelo.
+    try:
+        print("Reproduciendo audio...")
+        # Usa 'aplay' (o el reproductor de tu sistema) para reproducir el archivo recién creado.
+        subprocess.run(["aplay", archivo_salida], check=True)
+    except FileNotFoundError:
+        print("Error: El comando 'aplay' no se encontró. Asegúrate de que ALSA utils esté instalado.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error al reproducir el audio: {e}")
+
+def reescribir_pregunta_con_historial(historial, pregunta):
+    if not historial: #Chance historial.strip()
+        print("No hay historial. Devolviendo pregunta original.")
+        return pregunta
+
+    prompt_reescrito = f"""A continuación tienes una conversación previa y una nueva pregunta.
+Usa la conversación para reescribir la pregunta de forma clara, completa y autónoma.
+
+Conversación:
+{historial}
+
+Nueva pregunta:
+{pregunta}
+
+Pregunta reescrita:"""
+
+    try:
+        print("Llamando a Ollama para reescribir pregunta...")
+        proceso = subprocess.run(
+            ["ollama", "run", "tinyllama"],
+            input=prompt_reescrito.encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20  # 20 segundos máximo
+        )
+
+        salida = proceso.stdout.decode().strip()
+        error = proceso.stderr.decode().strip()
+
+        if error:
+            print(f"[ERROR OLLAMA] {error}")
+        print(f"Pregunta reescrita: {salida}")
+        return salida
+
+    except subprocess.TimeoutExpired:
+        print("Timeout: Ollama no respondió.")
+        return pregunta
+
+def buscar_contexto(pregunta_reescrita):
+    print(f"[Buscando contexto para]: '{pregunta_reescrita}'")
+    try:
+        documentos = almacen_vectores.similarity_search(pregunta_reescrita, k=4)
+        if not documentos:
+            print("[Contexto]: No se encontraron documentos similares.")
+            return None
+        print(f"[Contexto]: {len(documentos)} documentos encontrados.")
+        for i, doc in enumerate(documentos):
+            print(f"[Doc {i+1}]: {doc.page_content[:80]}...")
+        return "\n".join([doc.page_content for doc in documentos])
+    except Exception as e:
+        print(f"[ERROR al buscar contexto]: {e}")
+        return None
+
+def generar_respuesta(contexto, pregunta):
+    print(f"[Generando respuesta con contexto y pregunta]")
+    prompt_final = f"""Usa la siguiente información para responder la pregunta del usuario de forma clara, en español.
+
+Contexto:
+{contexto}
+
+Pregunta:
+{pregunta}
+
+Respuesta:"""
+
+    try:
+        proceso = subprocess.run(
+            ["ollama", "run", "tinyllama"],
+            input=prompt_final.encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30  # dale 30s de margen
+        )
+        salida = proceso.stdout.decode().strip()
+        error = proceso.stderr.decode().strip()
+
+        if error:
+            print(f"[ERROR OLLAMA respuesta]: {error}")
+        print(f"[Respuesta generada]: {salida[:200]}...")  # limitamos output para evitar saturación
+        return salida if salida else "Lo siento, no entendí la pregunta."
+
+    except subprocess.TimeoutExpired:
+        print("[Timeout]: Ollama no respondió al generar respuesta.")
+        return "Lo siento, hubo un problema al generar la respuesta."
+
+def preguntar_a_tinyllama(pregunta):
+    print("===> INICIO DE PREGUNTAR_A_TINYLLAMA")
+    mensajes = memoria.load_memory_variables({})["history"]
+    if not mensajes:
+        historial = ""
+    else:
+        historial = "\n".join([f"{m['role']}: {m['content']}" for m in mensajes])
+
+    print("Historial cargado.")
+
+    pregunta_reescrita = reescribir_pregunta_con_historial(historial, pregunta)
+    print(f"Pregunta reescrita: {pregunta_reescrita}")
+
+    contexto = buscar_contexto(pregunta_reescrita)
+    print(f"Contexto encontrado: {contexto[:100] if contexto else 'Ninguno'}")
+
+    if contexto is None:
+        respuesta = "Lo siento, no encontré información suficiente para responder eso."
+    else:
+        respuesta = generar_respuesta(contexto, pregunta)
+
+    print("\nRespuesta de GlucIA:")
+    print(respuesta)
+
+    sintetizar_voz(respuesta)
+    memoria.save_context({"question": pregunta}, {"answer": respuesta})
+
+
+# ==== LOOP PRINCIPAL ====
+
+def main():
+    print("Asistente GlucIA (versión alpha) iniciado.")
+    while True:
+        ruta_audio = grabar_audio()
+        texto = transcribir_audio(ruta_audio)
+
+        if any(palabra in texto for palabra in ["glucia", "lucia", "glucía", "glusía", "lucía", "gluxia", "glusia", "luxia", "luzia", "lusia"]):
+            print("Hola. ¿Cuál es tu pregunta?")
+            ruta_pregunta = grabar_audio("pregunta.wav", duracion=6)
+            pregunta = transcribir_audio(ruta_pregunta)
+            preguntar_a_tinyllama(pregunta)
+
+        time.sleep(0.5)
+
+if __name__ == "__main__":
+    main()
